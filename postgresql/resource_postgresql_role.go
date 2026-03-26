@@ -423,7 +423,12 @@ func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) erro
 		for _, database := range databases {
 			dbTxn, err := startTransaction(db.client, database)
 			if err != nil {
-				return fmt.Errorf("could not connect to database %s for reassign: %w", database, err)
+				// Skip databases we can't connect to (e.g., RDS system databases
+				// not caught by the query filter, or databases where the role
+				// lacks CONNECT privilege). Log and continue rather than failing
+				// the entire drop operation.
+				log.Printf("[WARN] skipping database %s for reassign (connection failed): %v", database, err)
+				continue
 			}
 			err = func() error {
 				defer deferredRollback(dbTxn)

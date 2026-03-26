@@ -400,10 +400,18 @@ func dbExists(db QueryAble, dbname string) (bool, error) {
 	return true, nil
 }
 
-// listNonTemplateDatabases returns all databases that are not templates.
-// Used by multi-database REASSIGN OWNED to iterate all databases before role drop.
+// listNonTemplateDatabases returns all user-connectable databases.
+// Excludes templates (datistemplate), non-connectable databases (datallowconn),
+// and RDS system databases (rdsadmin) which reject external connections via pg_hba.conf
+// despite having datallowconn = true.
 func listNonTemplateDatabases(txn *sql.Tx) ([]string, error) {
-	rows, err := txn.Query("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")
+	rows, err := txn.Query(`
+		SELECT datname FROM pg_database
+		WHERE datistemplate = false
+		  AND datallowconn = true
+		  AND datname NOT IN ('rdsadmin')
+		ORDER BY datname
+	`)
 	if err != nil {
 		return nil, fmt.Errorf("could not list databases: %w", err)
 	}
