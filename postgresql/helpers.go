@@ -400,6 +400,52 @@ func dbExists(db QueryAble, dbname string) (bool, error) {
 	return true, nil
 }
 
+// listNonTemplateDatabases returns all databases that are not templates.
+// Used by multi-database REASSIGN OWNED to iterate all databases before role drop.
+func listNonTemplateDatabases(txn *sql.Tx) ([]string, error) {
+	rows, err := txn.Query("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")
+	if err != nil {
+		return nil, fmt.Errorf("could not list databases: %w", err)
+	}
+	defer rows.Close()
+
+	var databases []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("could not scan database name: %w", err)
+		}
+		databases = append(databases, name)
+	}
+	return databases, rows.Err()
+}
+
+// listRoleDependencies returns database names where the given role still has
+// dependent objects (via pg_shdepend). Used for a clear pre-drop error message.
+func listRoleDependencies(txn *sql.Tx, roleName string) ([]string, error) {
+	rows, err := txn.Query(`
+		SELECT DISTINCT d.datname
+		FROM pg_shdepend sd
+		JOIN pg_roles r ON r.oid = sd.refobjid
+		JOIN pg_database d ON d.oid = sd.dbid
+		WHERE r.rolname = $1 AND sd.deptype = 'o'
+	`, roleName)
+	if err != nil {
+		return nil, fmt.Errorf("could not query role dependencies: %w", err)
+	}
+	defer rows.Close()
+
+	var deps []string
+	for rows.Next() {
+		var dbName string
+		if err := rows.Scan(&dbName); err != nil {
+			return nil, fmt.Errorf("could not scan dependency database: %w", err)
+		}
+		deps = append(deps, dbName)
+	}
+	return deps, rows.Err()
+}
+
 func roleExists(txn *sql.Tx, rolname string) (bool, error) {
 	err := txn.QueryRow("SELECT 1 FROM pg_roles WHERE rolname=$1", rolname).Scan(&rolname)
 	switch {
@@ -566,21 +612,23 @@ func getRoleOID(db QueryAble, role string) (uint32, error) {
 	return oid, nil
 }
 
+// pgLockCatalog acquires a global advisory lock to serialize all PostgreSQL
+// catalog mutations (GRANT, REVOKE, ALTER DEFAULT PRIVILEGES, role changes).
+// The upstream per-role lock (hashing the role OID) is insufficient because
+// different roles modifying the same database/schema catalog rows
+// (pg_default_acl, pg_auth_members) still produce "tuple concurrently updated"
+// errors. A single global lock ID serializes all such operations server-side
+// while allowing Terraform to parallelize non-PostgreSQL resources freely.
+const pgCatalogLockID = 7_215_018_387 // arbitrary fixed constant
+
 // Lock a role and all his members to avoid concurrent updates on some resources
 func pgLockRole(txn *sql.Tx, role string) error {
 	// Disable statement timeout for this connection otherwise the lock could fail
 	if _, err := txn.Exec("SET statement_timeout = 0"); err != nil {
 		return fmt.Errorf("could not disable statement_timeout: %w", err)
 	}
-	if _, err := txn.Exec("SELECT pg_advisory_xact_lock(oid::bigint) FROM pg_roles WHERE rolname = $1", role); err != nil {
-		return fmt.Errorf("could not get advisory lock for role %s: %w", role, err)
-	}
-
-	if _, err := txn.Exec(
-		"SELECT pg_advisory_xact_lock(member::bigint) FROM pg_auth_members JOIN pg_roles ON roleid = pg_roles.oid WHERE rolname = $1",
-		role,
-	); err != nil {
-		return fmt.Errorf("could not get advisory lock for members of role %s: %w", role, err)
+	if _, err := txn.Exec("SELECT pg_advisory_xact_lock($1)", pgCatalogLockID); err != nil {
+		return fmt.Errorf("could not get global advisory lock for catalog operations (role %s): %w", role, err)
 	}
 
 	return nil

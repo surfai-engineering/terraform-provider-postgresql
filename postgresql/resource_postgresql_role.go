@@ -32,6 +32,7 @@ const (
 	roleReplicationAttr                     = "replication"
 	roleSkipDropRoleAttr                    = "skip_drop_role"
 	roleSkipReassignOwnedAttr               = "skip_reassign_owned"
+	roleTerminateSessionsAttr               = "terminate_sessions_on_drop"
 	roleSuperuserAttr                       = "superuser"
 	roleValidUntilAttr                      = "valid_until"
 	roleRolesAttr                           = "roles"
@@ -181,6 +182,12 @@ func resourcePostgreSQLRole() *schema.Resource {
 				Optional:    true,
 				Default:     false,
 				Description: "Skip actually running the REASSIGN OWNED command when removing a role from PostgreSQL",
+			},
+			roleTerminateSessionsAttr: {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				Description: "Terminate active sessions for this role before dropping it",
 			},
 			roleStatementTimeoutAttr: {
 				Type:         schema.TypeInt,
@@ -392,22 +399,70 @@ func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) erro
 		return err
 	}
 
-	if !d.Get(roleSkipReassignOwnedAttr).(bool) {
-		if err := withRolesGranted(txn, []string{roleName}, func() error {
-			currentUser := db.client.config.getDatabaseUsername()
-			if _, err := txn.Exec(fmt.Sprintf("REASSIGN OWNED BY %s TO %s", pq.QuoteIdentifier(roleName), pq.QuoteIdentifier(currentUser))); err != nil {
-				return fmt.Errorf("could not reassign owned by role %s to %s: %w", roleName, currentUser, err)
-			}
-
-			if _, err := txn.Exec(fmt.Sprintf("DROP OWNED BY %s", pq.QuoteIdentifier(roleName))); err != nil {
-				return fmt.Errorf("could not drop owned by role %s: %w", roleName, err)
-			}
-			return nil
-		}); err != nil {
-			return err
+	// Terminate active sessions if opt-in attribute is set (Fix 4).
+	if d.Get(roleTerminateSessionsAttr).(bool) {
+		if _, err := txn.Exec(
+			"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1 AND pid <> pg_backend_pid()",
+			roleName,
+		); err != nil {
+			return fmt.Errorf("could not terminate sessions for role %s: %w", roleName, err)
 		}
 	}
+
+	if !d.Get(roleSkipReassignOwnedAttr).(bool) {
+		// Reassign and drop owned objects across ALL databases, not just the
+		// provider's connected database. This fixes upstream issues #203 and #435
+		// where REASSIGN OWNED only ran against a single database, leaving
+		// cross-database dependencies that blocked DROP ROLE.
+		databases, err := listNonTemplateDatabases(txn)
+		if err != nil {
+			return fmt.Errorf("could not list databases for multi-db reassign: %w", err)
+		}
+
+		currentUser := db.client.config.getDatabaseUsername()
+		for _, database := range databases {
+			dbTxn, err := startTransaction(db.client, database)
+			if err != nil {
+				return fmt.Errorf("could not connect to database %s for reassign: %w", database, err)
+			}
+			err = func() error {
+				defer deferredRollback(dbTxn)
+				return withRolesGranted(dbTxn, []string{roleName}, func() error {
+					if _, err := dbTxn.Exec(fmt.Sprintf(
+						"REASSIGN OWNED BY %s TO %s",
+						pq.QuoteIdentifier(roleName), pq.QuoteIdentifier(currentUser),
+					)); err != nil {
+						return fmt.Errorf("could not reassign owned by role %s to %s in database %s: %w", roleName, currentUser, database, err)
+					}
+					if _, err := dbTxn.Exec(fmt.Sprintf(
+						"DROP OWNED BY %s",
+						pq.QuoteIdentifier(roleName),
+					)); err != nil {
+						return fmt.Errorf("could not drop owned by role %s in database %s: %w", roleName, database, err)
+					}
+					return dbTxn.Commit()
+				})
+			}()
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	if !d.Get(roleSkipDropRoleAttr).(bool) {
+		// Pre-drop dependency check: enumerate databases with remaining
+		// dependencies to produce a clear error message (Fix 3).
+		deps, depErr := listRoleDependencies(txn, roleName)
+		if depErr != nil {
+			log.Printf("[WARN] could not check role dependencies before drop: %v", depErr)
+		} else if len(deps) > 0 {
+			return fmt.Errorf(
+				"role %s still has dependent objects in databases: %s — "+
+					"set skip_reassign_owned = false to clean them automatically",
+				roleName, strings.Join(deps, ", "),
+			)
+		}
+
 		if _, err := txn.Exec(fmt.Sprintf("DROP ROLE %s", pq.QuoteIdentifier(roleName))); err != nil {
 			return fmt.Errorf("could not delete role %s: %w", roleName, err)
 		}
@@ -509,6 +564,7 @@ func resourcePostgreSQLRoleReadImpl(db *DBConnection, d *schema.ResourceData) er
 	d.Set(roleLoginAttr, roleCanLogin)
 	d.Set(roleSkipDropRoleAttr, d.Get(roleSkipDropRoleAttr).(bool))
 	d.Set(roleSkipReassignOwnedAttr, d.Get(roleSkipReassignOwnedAttr).(bool))
+	d.Set(roleTerminateSessionsAttr, d.Get(roleTerminateSessionsAttr).(bool))
 	d.Set(roleSuperuserAttr, roleSuperuser)
 	d.Set(roleValidUntilAttr, roleValidUntil)
 	d.Set(roleReplicationAttr, roleReplication)
