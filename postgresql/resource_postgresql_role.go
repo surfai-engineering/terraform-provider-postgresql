@@ -427,7 +427,7 @@ func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) erro
 			}
 			err = func() error {
 				defer deferredRollback(dbTxn)
-				return withRolesGranted(dbTxn, []string{roleName}, func() error {
+				if err := withRolesGranted(dbTxn, []string{roleName}, func() error {
 					if _, err := dbTxn.Exec(fmt.Sprintf(
 						"REASSIGN OWNED BY %s TO %s",
 						pq.QuoteIdentifier(roleName), pq.QuoteIdentifier(currentUser),
@@ -440,8 +440,11 @@ func resourcePostgreSQLRoleDelete(db *DBConnection, d *schema.ResourceData) erro
 					)); err != nil {
 						return fmt.Errorf("could not drop owned by role %s in database %s: %w", roleName, database, err)
 					}
-					return dbTxn.Commit()
-				})
+					return nil
+				}); err != nil {
+					return err
+				}
+				return dbTxn.Commit()
 			}()
 			if err != nil {
 				return err
